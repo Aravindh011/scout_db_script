@@ -1,4 +1,4 @@
-## Data Import System
+## DB Scipt
 OverviewThe script is designed to process Excel files containing stock data and store relevant data in the database while handling missing stock entries and sending alerts for them.
 
 ## Files in the System:
