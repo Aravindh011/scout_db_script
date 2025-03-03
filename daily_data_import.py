@@ -10,7 +10,6 @@ def upload_daily_data(file_name, local_file_path):
     message = "Initiating upload of daily data"
 
     try:
-        #aws file
         df = pd.read_excel(local_file_path, sheet_name=0)
         rows_to_check, stock_names = process_local_excel_file(df)
 
@@ -31,25 +30,45 @@ def upload_daily_data(file_name, local_file_path):
             return
         
         metadata_id = metadata_result[0]
-        print(f"Metadata ID: {metadata_id}")
 
-        # Fetch the latest date from stock table for the given metadata_id
-        latest_date = get_latest_stock_date(cursor, metadata_id)
-        print(f"Latest date from stock_table: {latest_date}")
+        # Fetch existing stock entries for this date
+        missing_stocks = []
+        stock_map = get_all_stock_ids(cursor, stock_names)
 
-        # converting to a pandas Timestamp for comparison
-        if latest_date:
-            latest_date = pd.Timestamp(latest_date)
+        for _, row in rows_to_check.iterrows():
 
-        # Compare and filter new rows
-        new_rows = rows_to_check[rows_to_check['Dates'] > latest_date]
+            date_value = row['Dates']
 
-        if not new_rows.empty:
-            print(f"Found {len(new_rows)} new rows. Inserting into stock_table...")
-            missing_stocks = insert_new_rows(cursor, new_rows, stock_names, metadata_id)
-            connection.commit()
-        else:
-            print("No new rows to insert.")
+            # Fetch existing stock data for this date (name -> id mapping)
+            existing_stock_map = get_existing_stock_data(cursor, metadata_id, date_value)
+            
+            # Find missing stocks
+            missing_stocks_for_date = [stock_name for stock_name in stock_names if stock_name not in existing_stock_map]
+
+            if not missing_stocks_for_date:
+                print(f"All stocks already exist for {date_value}. Skipping insertion.")
+                continue
+
+            # Insert only missing stocks
+            for stock_name in missing_stocks_for_date:
+                value = row.get(stock_name)
+                if pd.isna(value):  # Skip if value is NaN
+                    continue
+
+                stock_id = stock_map.get(stock_name)  # Get stock_id from stock_map
+                if stock_id is None:
+                    print(f"Warning: No stock_id found for {stock_name}")
+                    missing_stocks.append(stock_name)
+                    continue
+
+                cursor.execute(
+                    """
+                    INSERT INTO f_stock_data (stock_id, metadata_id, data, date, created_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    """,
+                    (stock_id, metadata_id, value, date_value)
+                )
+        connection.commit()
 
     except Exception as e:
         print(f"An error occurred: {e}")
@@ -79,62 +98,30 @@ def process_local_excel_file(df):
     # Extract the first 10 rows for processing
     rows_to_check = df.head(10)
 
-    print(rows_to_check)
-
     return rows_to_check, insert_stock_names
 
 
-def get_latest_stock_date(cursor, metadata_id):
+def get_existing_stock_data(cursor, metadata_id, date_value):
+    """Fetch all stock names and their IDs for a given date and metadata_id."""
     query = """
-        SELECT MAX(date) AS latest_date 
-        FROM f_stock_data 
-        WHERE metadata_id = %s
+        SELECT m_stock.id, m_stock.ticker FROM f_stock_data 
+        JOIN m_stock ON f_stock_data.stock_id = m_stock.id
+        WHERE f_stock_data.metadata_id = %s AND f_stock_data.date = %s
     """
-    cursor.execute(query, (metadata_id,))
-    result = cursor.fetchone()
-    return result[0] if result and result[0] else None
+    cursor.execute(query, (metadata_id, date_value))
+    result = cursor.fetchall()
+    # Convert to a dictionary {stock_name: stock_id}
+    return {row[1]: row[0] for row in result}  # {name -> id}
 
 
-def insert_new_rows(cursor, rows, stock_names, metadata_id):
-    stock_query = "SELECT id, name, ticker FROM m_stock WHERE ticker IN ({})".format(",".join(["%s"] * len(stock_names)))
-    print("Executing SQL Query:", stock_query)
-    print("With Values:", stock_names)
+def get_all_stock_ids(cursor, stock_names):
+    stock_query = "SELECT id, ticker FROM m_stock WHERE ticker IN ({})".format(",".join(["%s"] * len(stock_names)))
     
     cursor.execute(stock_query, stock_names)
     fetched_results = cursor.fetchall()
-    print("Fetched Results from Database:", fetched_results)
 
-    #mapping of ticker -> stock_id
-    stock_map = {ticker: stock_id for stock_id, name, ticker in fetched_results}
+    # Create a mapping of ticker -> stock_id
+    stock_map = {ticker: stock_id for stock_id, ticker in fetched_results}
 
-    # Debugging print
-    print("Stock Map:", stock_map)
-
-    missing_stocks = []
-
-    # Insert data into f_stock_data
-    for _, row in rows.iterrows():
-        date_value = row['Dates']
-        if pd.isna(date_value):  # Skip if date is NaN
-            continue
-
-        for stock_name, value in row.items():
-            if stock_name == 'Dates' or pd.isna(value):  # Skip 'Dates' column and NaN values
-                continue
-
-            stock_id = stock_map.get(stock_name)  # Correct mapping to ticker
-            if stock_id is None:
-                print(f"Warning: No stock_id found for {stock_name}")
-                missing_stocks.append(stock_name)
-                continue
-            print("executing ", value)
-            cursor.execute(
-                """
-                INSERT INTO f_stock_data (stock_id, metadata_id, data, date, created_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                """,
-                (stock_id, metadata_id, value, date_value)
-            )
-
-    return missing_stocks
+    return stock_map
 
