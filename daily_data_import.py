@@ -2,9 +2,9 @@ import pandas as pd
 from email_sender import send_email
 from database import get_db_connection, close_db_connection
 
-
 def upload_daily_data(file_name, local_file_path):
-    # Database connection
+    """Uploads daily stock data from an Excel file to the database."""
+
     connection, cursor = get_db_connection()
     missing_stocks = []
     message = "Initiating upload of daily data"
@@ -13,74 +13,77 @@ def upload_daily_data(file_name, local_file_path):
         df = pd.read_excel(local_file_path, sheet_name=0)
         rows_to_check, stock_names = process_local_excel_file(df)
 
-        # Fetch the metadata_id (volume/price/market_cap)
-        identifier = None
-        if "MC_USD" in file_name:
-            identifier = "MC"
-        elif "PX_USD" in file_name:
-            identifier = "PX"
-        elif "Vol_USD" in file_name:
-            identifier = "Volume"
-        cursor.execute("SELECT id FROM m_stock_metadata WHERE identifier = %s", (identifier,))
-        metadata_result = cursor.fetchone()
-
-        if not metadata_result:
-            print(f"Error: {file_name} metadata not found")
+        # Get metadata_id
+        metadata_id = fetch_metadata_id(cursor, file_name)
+        if metadata_id is None:
             message = f"Error: {file_name} metadata not found"
             return
-        
-        metadata_id = metadata_result[0]
 
-        # Fetch existing stock entries for this date
-        missing_stocks = []
+        # Get stock mappings
         stock_map = get_all_stock_ids(cursor, stock_names)
 
         for _, row in rows_to_check.iterrows():
+            process_stock_data(cursor, row, stock_names, stock_map, metadata_id, missing_stocks)
 
-            date_value = row['Dates']
-
-            # Fetch existing stock data for this date (name -> id mapping)
-            existing_stock_map = get_existing_stock_data(cursor, metadata_id, date_value)
-            
-            # Find missing stocks
-            missing_stocks_for_date = [stock_name for stock_name in stock_names if stock_name not in existing_stock_map]
-
-            if not missing_stocks_for_date:
-                print(f"All stocks already exist for {date_value}. Skipping insertion.")
-                continue
-
-            # Insert only missing stocks
-            for stock_name in missing_stocks_for_date:
-                value = row.get(stock_name)
-                if pd.isna(value):  # Skip if value is NaN
-                    continue
-
-                stock_id = stock_map.get(stock_name)  # Get stock_id from stock_map
-                if stock_id is None:
-                    print(f"Warning: No stock_id found for {stock_name}")
-                    missing_stocks.append(stock_name)
-                    continue
-
-                cursor.execute(
-                    """
-                    INSERT INTO f_stock_data (stock_id, metadata_id, data, date, created_at)
-                    VALUES (%s, %s, %s, %s, NOW())
-                    """,
-                    (stock_id, metadata_id, value, date_value)
-                )
         connection.commit()
 
     except Exception as e:
-        print(f"An error occurred: {e}")
         message = f"An error occurred: {e}"
+        print(message)
 
     finally:
         close_db_connection(connection, cursor)
         send_email(missing_stocks, message)
 
 
+def fetch_metadata_id(cursor, file_name):
+    """Fetch metadata ID based on file identifier."""
+    identifier_map = {"MC_USD": "MC", "PX_USD": "PX", "Vol_USD": "Volume"}
+    identifier = next((v for k, v in identifier_map.items() if k in file_name), None)
+
+    if not identifier:
+        return None
+
+    cursor.execute("SELECT id FROM m_stock_metadata WHERE identifier = %s", (identifier,))
+    result = cursor.fetchone()
+    return result[0] if result else None
+
+
+def process_stock_data(cursor, row, stock_names, stock_map, metadata_id, missing_stocks):
+    """Process and insert stock data for a specific date."""
+    date_value = row['Dates']
+    existing_stock_map = get_existing_stock_data(cursor, metadata_id, date_value)
+
+    missing_stocks_for_date = [s for s in stock_names if s not in existing_stock_map]
+    if not missing_stocks_for_date:
+        print(f"All stocks already exist for {date_value}. Skipping insertion.")
+        return
+
+    insert_missing_stocks(cursor, row, missing_stocks_for_date, stock_map, metadata_id, date_value, missing_stocks)
+
+
+def insert_missing_stocks(cursor, row, missing_stocks_for_date, stock_map, metadata_id, date_value, missing_stocks):
+    """Insert missing stock data into the database."""
+    for stock_name in missing_stocks_for_date:
+        value = row.get(stock_name)
+        if pd.isna(value):
+            continue
+
+        stock_id = stock_map.get(stock_name)
+        if stock_id is None:
+            print(f"Warning: No stock_id found for {stock_name}")
+            missing_stocks.append(stock_name)
+            continue
+
+        cursor.execute(
+            """
+            INSERT INTO f_stock_data (stock_id, metadata_id, data, date, created_at)
+            VALUES (%s, %s, %s, %s, NOW())
+            """,
+            (stock_id, metadata_id, value, date_value)
+        )
+
 def process_local_excel_file(df):
-    df = df
 
     # Stock names from the 2th row (index 1)
     stock_names = df.iloc[2, 1:].dropna().values
